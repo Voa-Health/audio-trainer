@@ -1,0 +1,14 @@
+# Install the latest version of datasets from GitHub
+git+https://github.com/huggingface/datasets.git@main#egg=datasets
+
+# Install the latest version of transformers with torch extras from GitHub
+git+https://github.com/huggingface/transformers.git@main#egg=transformers[torch]
+
+# Additional Python packages
+librosa
+evaluate>=0.3.0
+jiwer
+gradio
+more-itertools
+accelerate
+tensorboard
