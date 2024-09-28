@@ -6,6 +6,7 @@ import argparse
 import torch
 import evaluate
 import logging
+import random
 from transformers import (
     WhisperForConditionalGeneration,
     WhisperProcessor,
@@ -15,6 +16,7 @@ from transformers import (
     TrainerCallback,
     logging as transformers_logging,  # Import the transformers logging module
 )
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from datasets import load_dataset, Audio
 from typing import Any, Dict, List, Union
 from dataclasses import dataclass
@@ -74,7 +76,10 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--fp16', action='store_true', help='Use FP16 mixed precision training')
     parser.add_argument('--push_to_hub', action='store_true', help='Push the model to Hugging Face Hub')
-    parser.add_argument('--dataloader_num_workers', type=int, default=4, help='Number of subprocesses for data loading')
+    
+    # Add argument for testing mode
+    parser.add_argument('--test_mode', type=bool, default=False, help='Run the script in test mode with a small dataset and 10 steps for quick validation')
+    
     args = parser.parse_args()
 
     # Set the seed for reproducibility
@@ -113,42 +118,76 @@ def main():
     train_dataset = load_dataset("voa-engines/features_dataset_v1", split="train")
     eval_dataset = load_dataset("voa-engines/features_dataset_v1", split="validation")
 
+    # For testing purposes, select a random sample of the dataset based on its number of rows
+    if args.test_mode:
+        # Select random indices from the train dataset based on its total number of rows
+        train_num_rows = train_dataset.num_rows
+        eval_num_rows = eval_dataset.num_rows
+
+        # Generate random indices
+        train_indices = random.sample(range(train_num_rows), k=180)
+        eval_indices = random.sample(range(eval_num_rows), k=20)
+
+        # Use the random indices to select a subset
+        train_dataset = train_dataset.select(train_indices)
+        eval_dataset = eval_dataset.select(eval_indices)
+
+        # Set the number of steps and epochs for quick testing
+        args.max_steps = 10  # Run only 10 steps in test mode
+        args.num_train_epochs = 1  # Run only 1 epoch
+        
+        # Disable pushing to Hugging Face Hub when in test mode
+        args.push_to_hub = False
+
     logger.info("Shuffling train dataset...")
     train_dataset = train_dataset.with_format(None)
-    iterable_dataset = train_dataset.to_iterable_dataset(num_shards=128)
-    train_dataset = iterable_dataset.shuffle(seed=42, buffer_size=400)
 
     # Define evaluation metric
     logger.info("Loading evaluation metric...")
     metric = evaluate.load("wer")
 
     # Define normalizer if needed
-    from transformers.models.whisper.english_normalizer import BasicTextNormalizer
     normalizer = BasicTextNormalizer()
 
     do_normalize_eval = True  # Set to False if you don't want to normalize during evaluation
 
-    # Define compute_metrics function
     def compute_metrics(pred):
         pred_ids = pred.predictions
         label_ids = pred.label_ids
 
-        # Replace -100 with the pad_token_id
+        # Ensure pred_ids and label_ids are not empty or None before proceeding
+        if pred_ids is None or label_ids is None:
+            return {"wer": float('inf')}
+
+        # Replace -100 with the pad_token_id in label_ids
         label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
-        # Decode predictions and references
+        # Ensure that pred_ids and label_ids are of the same length
+        if len(pred_ids) == 0 or len(label_ids) == 0:
+            return {"wer": float('inf')}  # Return a high WER value if there's no valid prediction or label
+
+        # Decode predictions and references, filtering out invalid or empty sequences
         pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
+        # If normalization is enabled, apply the normalizer
         if do_normalize_eval:
             pred_str = [normalizer(pred) for pred in pred_str]
             label_str = [normalizer(label) for label in label_str]
-            # Filtering step to only evaluate samples that have non-empty references
-            pred_str = [pred_str[i] for i in range(len(pred_str)) if len(label_str[i]) > 0]
-            label_str = [label_str[i] for i in range(len(label_str)) if len(label_str[i]) > 0]
 
+        # Filtering step to only evaluate samples that have non-empty references
+        pred_str = [pred for pred, label in zip(pred_str, label_str) if len(label) > 0]
+        label_str = [label for label in label_str if len(label) > 0]
+
+        # Ensure there is something to compare after filtering
+        if len(pred_str) == 0 or len(label_str) == 0:
+            return {"wer": float('inf')}  # Return a high WER value if there's nothing to compare
+
+        # Calculate Word Error Rate (WER)
         wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+
         return {"wer": wer}
+
 
     # Define the training arguments
     training_args = Seq2SeqTrainingArguments(
@@ -181,7 +220,6 @@ def main():
         dataloader_num_workers=args.dataloader_num_workers,
         remove_unused_columns=False,
         ddp_find_unused_parameters=False,
-        # Removed 'logging_level' parameter
     )
 
     # Initialize the Trainer

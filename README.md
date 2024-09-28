@@ -169,7 +169,7 @@ This configuration ensures that `accelerate` is set up to use all available GPUs
 Use the following command to start the fine-tuning process:
 
 ```bash
-accelerate launch --multi_gpu --mixed_precision=fp16 finetune.py \
+accelerate launch --multi_gpu --mixed_precision fp16 finetune.py \
   --output_dir "./whisper-finetuned" \
   --num_train_epochs 3 \
   --per_device_train_batch_size 8 \
@@ -183,7 +183,7 @@ accelerate launch --multi_gpu --mixed_precision=fp16 finetune.py \
   --seed 42 \
   --fp16 \
   --push_to_hub \
-  --dataloader_num_workers 4
+  --test_mode True
 ```
 
 ### Explanation of Command-Line Arguments
