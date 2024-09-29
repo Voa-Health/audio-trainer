@@ -1,1 +1,11 @@
 .venv
+*.csv
+*.json
+*.txt
+*.log
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.npy
+*.DS_Store
