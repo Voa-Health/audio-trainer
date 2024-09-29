@@ -183,7 +183,7 @@ accelerate launch --multi_gpu --mixed_precision fp16 finetune.py \
   --seed 42 \
   --fp16 \
   --push_to_hub \
-  --test_mode True
+  --test_mode False
 ```
 
 ### Explanation of Command-Line Arguments
@@ -201,7 +201,7 @@ accelerate launch --multi_gpu --mixed_precision fp16 finetune.py \
 - `--seed`: Random seed for reproducibility.
 - `--fp16`: Enable mixed precision training.
 - `--push_to_hub`: Push the fine-tuned model to Hugging Face Hub.
-- `--dataloader_num_workers`: Number of subprocesses for data loading.
+- `--test_mode`: Wether to run the script in test mode with a small dataset and 10 steps for quick validation.
 
 ### Environment Variables (Optional)
 
