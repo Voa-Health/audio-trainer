@@ -1,11 +1,69 @@
-.venv
+# Ignore Python virtual environments
+.venv/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.egg
+*.egg-info
+*.dist-info
+
+# Environment and package managers
+env/
+venv/
+Pipfile.lock
+poetry.lock
+conda-meta/
+
+# Caches and logs
+*.log
+*.cache
+*.tmp
+*.temp
+*.swp
+
+# Text and data files
 *.csv
 *.json
 *.txt
-*.log
-*.pth
-*.pt
+*.md
+*.xlsx
 *.pkl
 *.pickle
 *.npy
-*.DS_Store
+
+# Audio and video files
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mov
+*.flv
+*.wmv
+*.mkv
+
+# Ignore large binary or model files
+*.pth
+*.pt
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.iml
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Additional gitignore patterns for your project
+*.tar
+*.gz
+*.zip
+
+.trunk/
