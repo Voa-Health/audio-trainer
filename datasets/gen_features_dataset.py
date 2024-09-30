@@ -1,27 +1,25 @@
 import os
 import time
-import requests
-import pandas as pd
 import torchaudio
+import pandas as pd
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import argparse
 import logging
-from urllib3.util import Retry
-from requests.adapters import HTTPAdapter
 import json
 from tqdm import tqdm
+from transformers import WhisperProcessor
 
 # Configuration
 target_sample_rate = 16000
 max_duration_sec = 30  # Maximum duration of the audio in seconds
 max_workers = 4  # Number of parallel workers (adjust based on your system)
-do_lower_case = True  # Whether to lower-case the transcription
-do_remove_punctuation = True  # Whether to remove punctuation
+do_lower_case = False  # Whether to lower-case the transcription
+do_remove_punctuation = False  # Whether to remove punctuation
 punctuation_to_remove_regex = re.compile(r'[^\w\s]')  # Regex for removing punctuation
 
 # Processor and tokenizer setup (replace with your processor and tokenizer setup)
-processor = None  # Placeholder for your feature extractor and tokenizer
+processor = WhisperProcessor.from_pretrained("pierreguillou/whisper-medium-portuguese", language="Portuguese", task="transcribe")
 
 # Prepare the dataset function with retries for torchaudio.load()
 def prepare_dataset(row):
@@ -102,15 +100,6 @@ def prepare_dataset(row):
         logging.error(f"Error processing {row.get('new_audio_url', 'unknown URL')}: {str(e)}")
         return None
 
-
-def get_with_retries(url, retries=3, backoff_factor=0.3, timeout=30):
-    session = requests.Session()
-    retry = Retry(total=retries, backoff_factor=backoff_factor)
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session.get(url, timeout=timeout)
-
 # Function to process a batch of rows from the CSV
 def process_batch(rows):
     processed_data = []
@@ -120,31 +109,39 @@ def process_batch(rows):
             processed_data.append(result)
     return processed_data
 
-# Save intermediate results to avoid data loss
+# Save intermediate results as JSONL
 def save_intermediate_results(results, output_file):
-    df = pd.DataFrame(results)
-    if not os.path.exists(output_file):
-        df.to_csv(output_file, mode='w', index=False)
-    else:
-        df.to_csv(output_file, mode='a', header=False, index=False)
+    with open(output_file, 'a') as f:
+        for result in results:
+            json.dump(result, f)
+            f.write('\n')
     logging.info(f"Saved {len(results)} rows to {output_file}")
 
+# Save final results to CSV
+def save_csv_results(results, output_csv):
+    df_results = pd.DataFrame(results)
+    df_results.to_csv(output_csv, index=False)
+    logging.info(f"Saved {len(results)} rows to {output_csv}")
+
+# Save checkpoint for resuming the process
 def save_checkpoint(processed_rows, checkpoint_file):
     with open(checkpoint_file, 'w') as f:
         json.dump({'processed_rows': processed_rows}, f)
 
+# Load checkpoint to resume processing from where it stopped
 def load_checkpoint(checkpoint_file):
     if os.path.exists(checkpoint_file):
         with open(checkpoint_file, 'r') as f:
             return json.load(f)['processed_rows']
     return 0
 
+# Batch generator to process the data in chunks
 def batch_generator(data, batch_size):
     for i in range(0, len(data), batch_size):
         yield data.iloc[i:i + batch_size]
 
-# Main function to load the CSV, process audio, and save results
-def main(input_csv, output_csv, sample_size, temp_file, checkpoint_file):
+# Main function
+def main(input_csv, output_jsonl, output_csv, sample_size, temp_file, checkpoint_file):
     # Load the CSV file
     data = pd.read_csv(input_csv)
 
@@ -153,6 +150,7 @@ def main(input_csv, output_csv, sample_size, temp_file, checkpoint_file):
         data = data.sample(n=sample_size)
         logging.info(f"Processing a sample of {sample_size} rows")
 
+    # Load the checkpoint to resume processing
     processed_rows = load_checkpoint(checkpoint_file)
     data = data.iloc[processed_rows:]
 
@@ -179,17 +177,19 @@ def main(input_csv, output_csv, sample_size, temp_file, checkpoint_file):
 
         progress_bar.close()
 
-    # Convert the results to a DataFrame and save to CSV
-    df_results = pd.DataFrame(results)
-    df_results.to_csv(output_csv, index=False)
-    logging.info(f"Processed dataset saved to {output_csv}")
+    # Save final results to both JSONL and CSV
+    save_intermediate_results(results, output_jsonl)
+    save_csv_results(results, output_csv)
+
+    logging.info(f"Processed dataset saved to {output_jsonl} and {output_csv}")
 
 if __name__ == '__main__':
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Process audio URLs and extract features.")
     parser.add_argument('--input_csv', type=str, required=True, help="Input CSV file with audio URLs")
+    parser.add_argument('--output_jsonl', type=str, required=True, help="Output JSONL file to save extracted features")
     parser.add_argument('--output_csv', type=str, required=True, help="Output CSV file to save extracted features")
-    parser.add_argument('--temp_file', type=str, default='temp_results.csv', help="Temporary file to store intermediate results")
+    parser.add_argument('--temp_file', type=str, default='temp_results.jsonl', help="Temporary file to store intermediate results")
     parser.add_argument('--sample_size', type=str, default='Full', help="Sample size: 'Full' for full dataset, or integer for sample size")
     parser.add_argument('--checkpoint_file', type=str, default='checkpoint.json', help="File to store processing checkpoint")
 
@@ -203,4 +203,4 @@ if __name__ == '__main__':
                         handlers=[logging.FileHandler("processing.log"), logging.StreamHandler()])
 
     # Run main process
-    main(args.input_csv, args.output_csv, sample_size, args.temp_file, args.checkpoint_file)
+    main(args.input_csv, args.output_jsonl, args.output_csv, sample_size, args.temp_file, args.checkpoint_file)

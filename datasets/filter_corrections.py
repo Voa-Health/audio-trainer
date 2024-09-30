@@ -1,7 +1,9 @@
 import pandas as pd
-from collections import Counter
 import re
+import argparse
+from collections import Counter
 from difflib import SequenceMatcher
+import ast
 
 # Function to calculate Levenshtein similarity (edit distance ratio)
 def calculate_similarity(wrong_word, correct_word):
@@ -48,7 +50,7 @@ def concatenate_transcriptions(data):
 def analyze_corrections(row, correction_pair_freq, known_words, full_transcription_dict, min_pair_freq_threshold=2, similarity_threshold=0.7):
     corrections = eval(row['corrections'])
     potential_issues = []
-
+    correct_count = 0
     for correction in corrections:
         wrong_word = correction['wrong'].lower()
         correct_word = correction['correct'].lower()
@@ -78,10 +80,44 @@ def analyze_corrections(row, correction_pair_freq, known_words, full_transcripti
                 'is_correct_known': is_correct_known,
                 'appears_in_full_transcription': appears_in_full_transcription
             })
+        else:
+            correct_count += 1
 
-    return potential_issues
+    # If more than 50% of corrections are marked as wrong, flag this row for removal
+    if len(potential_issues) / max(1, len(corrections)) > 0.5:
+        return 'REMOVE', None
+    return 'KEEP', potential_issues
 
-# Function to process a large dataset
+# Function to replace corrections in the transcription if they are marked as correct
+def apply_corrections(row, correction_pair_freq, known_words, full_transcription_dict, min_pair_freq_threshold=2, similarity_threshold=0.7):
+    corrections = ast.literal_eval(row['corrections'])
+    transcription = row['transcription']
+    for correction in corrections:
+        wrong_word = correction['wrong'].lower()
+        correct_word = correction['correct'].lower()
+
+        pair_freq = correction_pair_freq.get((wrong_word, correct_word), 0)
+
+        # Calculate Levenshtein similarity
+        similarity = calculate_similarity(wrong_word, correct_word)
+
+        # Check if correct word is a known word
+        is_correct_known = correct_word in known_words
+
+        # Get the full transcription for the current audio
+        full_transcription = full_transcription_dict.get(row['audio_id'], '').lower()
+
+        # Check if the correct word appears in the full transcription
+        appears_in_full_transcription = correct_word in full_transcription
+
+        # Apply correction if not a potential issue
+        if not (pair_freq < min_pair_freq_threshold and similarity < similarity_threshold and not is_correct_known and not appears_in_full_transcription):
+            # Replace the wrong word with the correct one in the transcription
+            transcription = re.sub(rf'\b{wrong_word}\b', correct_word, transcription, flags=re.IGNORECASE)
+
+    return transcription
+
+# Function to process a large dataset and perform analysis
 def process_large_dataset(file_path, output_path, min_pair_freq_threshold=2, similarity_threshold=0.7, min_word_freq=5):
     # Load the dataset
     data = pd.read_csv(file_path)
@@ -97,39 +133,57 @@ def process_large_dataset(file_path, output_path, min_pair_freq_threshold=2, sim
 
     # Concatenate transcriptions based on audio_id and order
     concatenated_transcriptions = concatenate_transcriptions(data)
-    
+
     # Create a dictionary of full transcriptions for easy lookup
     full_transcription_dict = dict(zip(concatenated_transcriptions['audio_id'], concatenated_transcriptions['full_transcription']))
 
-    # Apply the analysis
-    data['potential_issues'] = data.apply(
-        analyze_corrections,
-        axis=1,
-        correction_pair_freq=correction_pair_freq,
-        known_words=known_words,
-        full_transcription_dict=full_transcription_dict,
-        min_pair_freq_threshold=min_pair_freq_threshold,
-        similarity_threshold=similarity_threshold
-    )
+    # Process rows
+    keep_rows = []
+    for _, row in data.iterrows():
+        status, _ = analyze_corrections(
+            row,
+            correction_pair_freq,
+            known_words,
+            full_transcription_dict,
+            min_pair_freq_threshold=min_pair_freq_threshold,
+            similarity_threshold=similarity_threshold
+        )
+        if status == 'KEEP':
+            # Apply correct corrections to the transcription
+            updated_transcription = apply_corrections(
+                row,
+                correction_pair_freq,
+                known_words,
+                full_transcription_dict,
+                min_pair_freq_threshold=min_pair_freq_threshold,
+                similarity_threshold=similarity_threshold
+            )
+            row['transcription'] = updated_transcription
+            keep_rows.append(row)
 
-    # Filter rows where potential issues were identified
-    issues_df = data[data['potential_issues'].apply(lambda x: len(x) > 0)]
+    # Create a new DataFrame with only the kept rows
+    final_df = pd.DataFrame(keep_rows)
 
-    # Save the filtered results
-    issues_df.to_csv(output_path, index=False)
-    print(f"Potential issues saved to {output_path}")
+    # Save the filtered and updated results
+    final_df.to_csv(output_path, index=False)
+    print(f"Filtered and updated dataset saved to {output_path}")
 
-# Example usage
+# Main function to accept inputs/outputs as arguments
 if __name__ == "__main__":
-    # Path to the large dataset CSV
-    input_file = 'audio_chunks_with_signed_urls.csv'
-    output_file = 'filtered_potential_issues.csv'
+    parser = argparse.ArgumentParser(description="Process audio transcription corrections.")
+    parser.add_argument('input_file', type=str, help="Path to the input dataset CSV")
+    parser.add_argument('output_file', type=str, help="Path to the output filtered dataset CSV")
+    parser.add_argument('--min_pair_freq_threshold', type=int, default=2, help="Minimum correction pair frequency threshold")
+    parser.add_argument('--similarity_threshold', type=float, default=0.7, help="Levenshtein similarity threshold")
+    parser.add_argument('--min_word_freq', type=int, default=3, help="Minimum word frequency to be considered a known word")
+
+    args = parser.parse_args()
 
     # Process the dataset and save the output
     process_large_dataset(
-        input_file,
-        output_file,
-        min_pair_freq_threshold=2,
-        similarity_threshold=0.7,
-        min_word_freq=5
+        args.input_file,
+        args.output_file,
+        min_pair_freq_threshold=args.min_pair_freq_threshold,
+        similarity_threshold=args.similarity_threshold,
+        min_word_freq=args.min_word_freq
     )
