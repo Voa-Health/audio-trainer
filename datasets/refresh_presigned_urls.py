@@ -58,7 +58,7 @@ def create_signed_urls_batch(supabase: Client, batch_items, expiry_duration: int
                 raise  # If all retries fail, propagate the exception
 
 # Process the dataset and generate new signed URLs in batches, saving intermediate results
-def update_presigned_urls(data: pd.DataFrame, supabase: Client, bucket_name: str, expiry_duration: int = 604800, batch_size: int = 1000, temp_file='temp_results.jsonl', failed_file='failed_rows.csv'):
+def update_presigned_urls(data: pd.DataFrame, supabase: Client, expiry_duration: int, batch_size: int = 1000, temp_file='temp_results.jsonl', failed_file='failed_rows.csv'):
     audio_urls = []
     failed_rows = []
 
@@ -158,12 +158,9 @@ def main():
         logging.error(f"Error initializing Supabase client: {e}")
         return
 
-    # Supabase bucket name
-    bucket_name = "audios/processed"
-
     # Update dataset with new signed URLs in batches, with intermediate saving
     try:
-        updated_data = update_presigned_urls(data, supabase, bucket_name, expiry_duration=3600, batch_size=1000, temp_file=temp_file, failed_file=failed_file)
+        updated_data = update_presigned_urls(data, supabase, expiry_duration=604800, batch_size=1000, temp_file=temp_file, failed_file=failed_file)
     except Exception as e:
         logging.error(f"Error updating presigned URLs: {e}")
         return

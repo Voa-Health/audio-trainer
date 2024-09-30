@@ -12,3 +12,4 @@ gradio
 more-itertools
 accelerate
 tensorboard
+torchaudio
