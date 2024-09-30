@@ -6,9 +6,10 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import argparse
 import time
 import secrets
-import argparse
+import json
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -28,72 +29,101 @@ def extract_filepath(audio_url):
     parsed_url = urlparse(audio_url)
     return parsed_url.path.replace("/storage/v1/object/sign/audios/processed/", "").split("?")[0]
 
-# Generate a new signed URL for a given filepath
-# Generate a new signed URL for a given filepath
-def generate_signed_url(supabase: Client, bucket_name: str, filepath: str, expiry_duration: int = 3600):
-    max_retries = 5
+# Batch creation for processing in chunks
+def batch(iterable, batch_size=1000):
+    length = len(iterable)
+    for i in range(0, length, batch_size):
+        yield iterable[i:i + batch_size]
 
+# Create signed URLs for a batch of filepaths with retries
+def create_signed_urls_batch(supabase: Client, batch_items, expiry_duration: int, max_retries=5):
     for attempt in range(max_retries):
         try:
-            # Initialize response before making the request
-            response = None
+            # Send the request to create signed URLs for the batch of items
+            response = supabase.storage.from_("audios").create_signed_urls(batch_items, expiry_duration)
 
-            # Attempt to create the signed URL
-            response = supabase.storage.from_(bucket_name).create_signed_url(filepath, expiry_duration)
-
-            # Check if the 'signedURL' key exists in the response
-            if response and isinstance(response, dict) and 'signedURL' in response:
-                return response['signedURL']
+            # Check if response is a list or a dictionary
+            if isinstance(response, list):
+                return [item["signedURL"] for item in response if "signedURL" in item]
+            elif isinstance(response, dict) and "signedURLs" in response:
+                return response["signedURLs"]
             else:
-                # Log detailed response info in case of failure to retrieve 'signedURL'
-                logging.error(f"Unexpected response format or missing 'signedURL' key for {filepath}. Response: {response}")
-                raise ValueError(f"Failed to generate signed URL for {filepath}")
-
+                logging.error(f"Unexpected response format: {response}")
+                raise ValueError("Unexpected response format when creating signed URLs.")
         except Exception as e:
-            logging.error(f"Attempt {attempt + 1} failed for {filepath}: {e}, Response: {response}")
-
-            # If not the last attempt, retry with backoff
+            logging.error(f"Error creating signed URLs for batch: {e}, Attempt {attempt + 1}")
             if attempt < max_retries - 1:
-                time.sleep(secrets.randbelow(3) + 1)  # Secure random backoff between 1-3 seconds
+                time.sleep(secrets.randbelow(3) + 1)  # Retry with backoff
             else:
-                # Raise the final exception after all retries
-                raise ValueError(f"Failed to generate signed URL for {filepath} after {max_retries} retries") from None
+                raise  # If all retries fail, propagate the exception
 
-# Process the dataset and generate new signed URLs
-def update_presigned_urls(data: pd.DataFrame, supabase: Client, bucket_name: str, expiry_duration: int = 604800):
-    with ThreadPoolExecutor(max_workers=24) as executor:
+# Process the dataset and generate new signed URLs in batches, saving intermediate results
+def update_presigned_urls(data: pd.DataFrame, supabase: Client, bucket_name: str, expiry_duration: int = 604800, batch_size: int = 1000, temp_file='temp_results.jsonl', failed_file='failed_rows.csv'):
+    audio_urls = []
+    failed_rows = []
+
+    chunks_id_list = data['audio_url'].tolist()
+    processed_audio_id_list = ["processed/" + extract_filepath(audio_url) for audio_url in chunks_id_list]
+
+    total_items = len(processed_audio_id_list)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:  # Adjust max_workers as needed
         futures = []
-        for _, row in data.iterrows():
-            future = executor.submit(process_row, row, supabase, bucket_name, expiry_duration)
-            futures.append(future)
 
-        new_urls = []
-        failed_rows = []
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing URLs"):
-            result = future.result()
-            if result is None:
-                failed_rows.append(row)
-            new_urls.append(result)
+        # Submit batch jobs
+        with tqdm(total=total_items, desc="Submitting batch jobs") as pbar:
+            for batch_items in batch(processed_audio_id_list, batch_size):
+                future = executor.submit(create_signed_urls_batch, supabase, batch_items, expiry_duration)
+                futures.append(future)
+                pbar.update(len(batch_items))
 
-    data['new_audio_url'] = new_urls
+        results = []
+
+        # Collect results from the futures
+        with tqdm(total=len(futures), desc="Processing results") as pbar:
+            for future in as_completed(futures):
+                try:
+                    batch_urls = future.result()
+                    results.append(batch_urls)
+                    # Save intermediate results
+                    save_intermediate_results(temp_file, batch_urls)
+                except Exception as e:
+                    logging.error(f"Error processing batch: {e}")
+                    failed_rows.append(batch_items)  # Append the batch that failed
+                pbar.update(1)
+
+        # Flatten results and add to audio_urls
+        audio_urls = [url for batch_urls in results for url in batch_urls]
 
     # Log the rows that failed to generate URLs
     if failed_rows:
         logging.error(f"Failed to generate signed URLs for {len(failed_rows)} rows.")
-        pd.DataFrame(failed_rows).to_csv("failed_rows.csv", index=False)
-        logging.info("Failed rows saved to failed_rows.csv")
+        pd.DataFrame(failed_rows).to_csv(failed_file, index=False)
+        logging.info(f"Failed rows saved to {failed_file}")
+
+    # Save the final results
+    save_intermediate_results(temp_file, audio_urls, is_final=True)
+
+    # Append the new signed URLs to the original dataset
+    if len(audio_urls) == len(data):
+        data['new_audio_url'] = audio_urls
+    else:
+        logging.error(f"Length mismatch between input data and generated URLs: {len(audio_urls)} vs {len(data)}")
+        # Handle the case when lengths don't match by saving a partial file
+        data['new_audio_url'] = audio_urls[:len(data)]
 
     return data
 
-def process_row(row, supabase: Client, bucket_name: str, expiry_duration: int = 3600):
-    audio_url = row['audio_url']
-    filepath = extract_filepath(audio_url)
-    try:
-        new_signed_url = generate_signed_url(supabase, bucket_name, filepath, expiry_duration)
-        return new_signed_url
-    except Exception as e:
-        logging.error(f"Error generating signed URL for {filepath} after retries: {e}")
-        return None  # Or return a fallback URL if needed
+# Save intermediate results to a file (JSONL format for simplicity)
+def save_intermediate_results(temp_file, results, is_final=False):
+    mode = 'w' if is_final else 'a'  # Overwrite on final save, append otherwise
+    with open(temp_file, mode) as f:
+        for result in results:
+            f.write(json.dumps(result) + '\n')
+    if is_final:
+        logging.info(f"Final results saved to {temp_file}")
+    else:
+        logging.info(f"Intermediate results saved to {temp_file}")
 
 # Main function
 def main():
@@ -105,10 +135,14 @@ def main():
     parser.add_argument('input_csv', type=str, help="Path to the input CSV file")
     parser.add_argument('--output_csv', type=str, default="updated_dataset_with_presigned_urls.csv",
                         help="Path to save the updated CSV file (default: updated_dataset_with_presigned_urls.csv)")
+    parser.add_argument('--temp_file', type=str, default="temp_results.jsonl", help="Path to save intermediate results")
+    parser.add_argument('--failed_file', type=str, default="failed_rows.csv", help="Path to save failed rows")
     args = parser.parse_args()
 
     input_file = args.input_csv
     output_file = args.output_csv
+    temp_file = args.temp_file
+    failed_file = args.failed_file
 
     # Load dataset
     try:
@@ -127,9 +161,9 @@ def main():
     # Supabase bucket name
     bucket_name = "audios/processed"
 
-    # Update dataset with new signed URLs
+    # Update dataset with new signed URLs in batches, with intermediate saving
     try:
-        updated_data = update_presigned_urls(data, supabase, bucket_name, expiry_duration=3600)
+        updated_data = update_presigned_urls(data, supabase, bucket_name, expiry_duration=3600, batch_size=1000, temp_file=temp_file, failed_file=failed_file)
     except Exception as e:
         logging.error(f"Error updating presigned URLs: {e}")
         return
