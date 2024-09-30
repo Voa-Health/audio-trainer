@@ -29,6 +29,7 @@ conda-meta/
 # Text and data files
 *.csv
 *.json
+*.jsonl
 *.txt
 *.md
 *.xlsx
