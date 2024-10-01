@@ -10,6 +10,7 @@ import logging
 import json
 from tqdm import tqdm
 from transformers import WhisperProcessor
+from torchaudio.transforms import Resample
 from datasets import Dataset
 import boto3
 from datetime import datetime
@@ -63,7 +64,7 @@ def prepare_dataset(row):
 
         # Optional resampling to 16kHz if required
         if sample_rate != target_sample_rate:
-            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sample_rate)
+            resampler = Resample(orig_freq=sample_rate, new_freq=target_sample_rate)
             incoming_waveform = resampler(incoming_waveform)
 
         # Compute input features using your processor's feature extractor
@@ -136,7 +137,13 @@ def save_dataset_results(results, batch_number):
 
     # Save to Parquet in memory
     try:
-        ds.to_parquet(buffer)
+        ds.to_parquet(
+            buffer,
+            batch_size=1000,
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
+        )
         buffer.seek(0)  # Reset buffer position
     except Exception as e:
         logging.error(f"Error saving to Parquet in memory: {str(e)}")
@@ -178,9 +185,10 @@ def main(input_csv, sample_size, checkpoint_file):
     # Load the CSV file
     data = pd.read_csv(input_csv)
 
+    data.dropna(subset=['transcription'], inplace=True)
+
     # Load the checkpoint to resume processing
     processed_ids = load_checkpoint(checkpoint_file)
-
     logging.info(f"Loaded {len(processed_ids)} IDs from checkpoint")
 
     # Filter out already processed rows
@@ -188,11 +196,11 @@ def main(input_csv, sample_size, checkpoint_file):
 
     # Handle sample size
     if sample_size == 'Full':
-        batch_size = 5000
         total_samples = len(data)
     else:
-        batch_size = min(int(sample_size), len(data))
-        total_samples = batch_size
+        total_samples = min(int(sample_size), len(data))
+
+    data = data.iloc[:total_samples]  # Limit data to total_samples
 
     logging.info(f"Total rows in input data: {len(data)}")
     logging.info(f"Sample size: {sample_size}")
@@ -200,15 +208,22 @@ def main(input_csv, sample_size, checkpoint_file):
 
     progress_bar = tqdm(total=total_samples, desc="Processing rows")
 
-    for batch_number, start_idx in enumerate(range(0, total_samples, batch_size), 1):
-        end_idx = min(start_idx + batch_size, total_samples)
-        current_batch = data.iloc[start_idx:end_idx]
+    large_batch_size = 1000
+    small_batch_size = 32
+
+    for large_batch_number, large_start_idx in enumerate(range(0, total_samples, large_batch_size), 1):
+        large_end_idx = min(large_start_idx + large_batch_size, total_samples)
+        current_large_batch = data.iloc[large_start_idx:large_end_idx]
 
         batch_results = []
         new_processed_ids = set()
 
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_batch, mini_batch) for mini_batch in batch_generator(current_batch, 32)]
+            futures = []
+            for small_start_idx in range(0, len(current_large_batch), small_batch_size):
+                small_end_idx = min(small_start_idx + small_batch_size, len(current_large_batch))
+                small_batch = current_large_batch.iloc[small_start_idx:small_end_idx]
+                futures.append(executor.submit(process_batch, small_batch))
 
             for future in as_completed(futures):
                 try:
@@ -220,16 +235,16 @@ def main(input_csv, sample_size, checkpoint_file):
                     logging.error(f"Error processing mini-batch: {str(e)}")
 
         if batch_results:
-            file_name = save_dataset_results(batch_results, batch_number)
+            file_name = save_dataset_results(batch_results, large_batch_number)
             processed_ids.update(new_processed_ids)
             save_checkpoint(processed_ids, checkpoint_file)
 
-            logging.info(f"Batch {batch_number} processed dataset saved to s3://{s3_bucket_name}/{file_name}")
-            logging.info(f"Processed IDs in this batch: {len(new_processed_ids)}")
+            logging.info(f"Large batch {large_batch_number} processed dataset saved to s3://{s3_bucket_name}/{file_name}")
+            logging.info(f"Processed IDs in this large batch: {len(new_processed_ids)}")
             logging.info(f"Total processed IDs so far: {len(processed_ids)}")
-            logging.info(f"Total processed results in this batch: {len(batch_results)}")
+            logging.info(f"Total processed results in this large batch: {len(batch_results)}")
         else:
-            logging.warning(f"No valid results were processed in batch {batch_number}.")
+            logging.warning(f"No valid results were processed in large batch {large_batch_number}.")
 
         # Clear memory
         del batch_results
