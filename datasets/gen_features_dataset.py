@@ -13,6 +13,7 @@ from transformers import WhisperProcessor
 from datasets import Dataset
 import boto3
 from datetime import datetime
+import gc
 
 # Configuration
 target_sample_rate = 16000
@@ -118,33 +119,24 @@ def process_batch(rows):
     for _, row in rows.iterrows():
         result = prepare_dataset(row)
         if result:
+            result['id'] = row['id']  # Add the ID to the result
             processed_data.append(result)
             processed_ids.append(row['id'])
     return processed_data, processed_ids
 
-def save_parquet_results(results):
-    # Generate a unique filename
+def save_dataset_results(results, batch_number):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"data_{timestamp}.parquet"
+    file_name = f"data_{timestamp}_batch_{batch_number}.parquet"
 
-    # Convert results to a Dataset object directly from the list of dictionaries
-    ds = Dataset.from_dict({
-        key: [result[key] for result in results]
-        for key in results[0].keys()
-    })
+    # Convert results to a Dataset object
+    ds = Dataset.from_pandas(pd.DataFrame(results))
 
     # Create an in-memory buffer
     buffer = io.BytesIO()
 
     # Save to Parquet in memory
     try:
-        num_bytes = ds.to_parquet(
-            buffer,
-            batch_size=1000,
-            compression='snappy',
-            use_dictionary=True,
-            write_statistics=True
-        )
+        ds.to_parquet(buffer)
         buffer.seek(0)  # Reset buffer position
     except Exception as e:
         logging.error(f"Error saving to Parquet in memory: {str(e)}")
@@ -153,10 +145,14 @@ def save_parquet_results(results):
     # Upload to S3
     try:
         s3.upload_fileobj(buffer, s3_bucket_name, file_name)
-        logging.info(f"Saved {len(results)} rows ({num_bytes} bytes) to s3://{s3_bucket_name}/{file_name}")
+        logging.info(f"Saved {len(results)} rows to s3://{s3_bucket_name}/{file_name}")
     except Exception as e:
         logging.error(f"Error uploading to S3: {str(e)}")
         raise
+    finally:
+        buffer.close()
+        del buffer
+        gc.collect()
 
     return file_name
 
@@ -204,48 +200,42 @@ def main(input_csv, sample_size, checkpoint_file):
 
     progress_bar = tqdm(total=total_samples, desc="Processing rows")
 
-    for start_idx in range(0, total_samples, batch_size):
+    for batch_number, start_idx in enumerate(range(0, total_samples, batch_size), 1):
         end_idx = min(start_idx + batch_size, total_samples)
         current_batch = data.iloc[start_idx:end_idx]
 
+        batch_results = []
+        new_processed_ids = set()
+
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
+            futures = [executor.submit(process_batch, mini_batch) for mini_batch in batch_generator(current_batch, 32)]
 
-            # Submit all mini-batches to the executor
-            for mini_batch in batch_generator(current_batch, 32):
-                futures.append(executor.submit(process_batch, mini_batch))
-
-            results = []
-            new_processed_ids = set()
             for future in as_completed(futures):
                 try:
-                    batch_results, batch_processed_ids = future.result()
-                    if batch_results:  # Check if batch_results is not empty
-                        results.extend(batch_results)
-                        # Update new_processed_ids with the IDs from this batch
-                        new_processed_ids.update(batch_processed_ids)
-                        progress_bar.update(len(batch_results))
-                    else:
-                        logging.warning("Received an empty batch result")
+                    mini_batch_results, mini_batch_processed_ids = future.result()
+                    batch_results.extend(mini_batch_results)
+                    new_processed_ids.update(mini_batch_processed_ids)
+                    progress_bar.update(len(mini_batch_results))
                 except Exception as e:
-                    logging.error(f"Error processing batch: {str(e)}")
+                    logging.error(f"Error processing mini-batch: {str(e)}")
 
-        # Update processed_ids with new_processed_ids and save checkpoint
-        processed_ids.update(new_processed_ids)
-        save_checkpoint(processed_ids, checkpoint_file)
+        if batch_results:
+            file_name = save_dataset_results(batch_results, batch_number)
+            processed_ids.update(new_processed_ids)
+            save_checkpoint(processed_ids, checkpoint_file)
 
-        # Save batch results to Parquet in S3
-        if results:
-            file_name = save_parquet_results(results)
-            logging.info(f"Batch processed dataset saved to s3://{s3_bucket_name}/{file_name}")
-            logging.info(f"Newly processed IDs in this batch: {len(new_processed_ids)}")
+            logging.info(f"Batch {batch_number} processed dataset saved to s3://{s3_bucket_name}/{file_name}")
+            logging.info(f"Processed IDs in this batch: {len(new_processed_ids)}")
             logging.info(f"Total processed IDs so far: {len(processed_ids)}")
-            logging.info(f"Total processed results in this batch: {len(results)}")
+            logging.info(f"Total processed results in this batch: {len(batch_results)}")
         else:
-            logging.warning(f"No valid results were processed in batch {start_idx//batch_size + 1}.")
+            logging.warning(f"No valid results were processed in batch {batch_number}.")
+
+        # Clear memory
+        del batch_results
+        gc.collect()
 
     progress_bar.close()
-
     logging.info("Processing completed.")
     logging.info(f"Total processed IDs: {len(processed_ids)}")
 
