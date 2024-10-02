@@ -17,10 +17,9 @@ from transformers import (
     logging as transformers_logging,  # Import the transformers logging module
 )
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
-from datasets import load_dataset, Audio
+from datasets import load_dataset
 from typing import Any, Dict, List, Union
 from dataclasses import dataclass
-import numpy as np
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -46,7 +45,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         # If bos token is appended in previous tokenization step,
         # cut bos token here as it's appended later anyways
-        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+        if labels.shape[1] > 0 and (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
             labels = labels[:, 1:]
 
         batch["labels"] = labels
@@ -65,21 +64,19 @@ def main():
     parser.add_argument('--model_name_or_path', type=str, default='pierreguillou/whisper-medium-portuguese', help='Pretrained model identifier')
     parser.add_argument('--output_dir', type=str, default='./whisper-finetuned', help='Directory to save the fine-tuned model')
     parser.add_argument('--num_train_epochs', type=int, default=3, help='Number of training epochs')
-    parser.add_argument('--per_device_train_batch_size', type=int, default=8, help='Training batch size per device')
+    parser.add_argument('--per_device_train_batch_size', type=int, default=64, help='Training batch size per device')
     parser.add_argument('--per_device_eval_batch_size', type=int, default=8, help='Evaluation batch size per device')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=8, help='Gradient accumulation steps')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
-    parser.add_argument('--max_steps', type=int, default=5000, help='Total number of training steps')
     parser.add_argument('--logging_steps', type=int, default=25, help='Logging interval')
     parser.add_argument('--eval_steps', type=int, default=1000, help='Evaluation interval')
     parser.add_argument('--save_steps', type=int, default=1000, help='Checkpoint save interval')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--fp16', action='store_true', help='Use FP16 mixed precision training')
     parser.add_argument('--push_to_hub', action='store_true', help='Push the model to Hugging Face Hub')
-    
     # Add argument for testing mode
     parser.add_argument('--test_mode', type=bool, default=False, help='Run the script in test mode with a small dataset and 10 steps for quick validation')
-    
+
     args = parser.parse_args()
 
     # Set the seed for reproducibility
@@ -110,13 +107,24 @@ def main():
 
     # Update model configuration
     model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
+    # Set suppress_tokens to None to use default suppression tokens
+    model.config.suppress_tokens = None
     model.config.use_cache = False  # Important for gradient checkpointing
 
-    # Load your datasets
-    logger.info("Loading datasets...")
-    train_dataset = load_dataset("voa-engines/features_dataset_v1", split="train")
-    eval_dataset = load_dataset("voa-engines/features_dataset_v1", split="validation")
+    # Load your datasets directly from Parquet files
+    logger.info("Loading datasets from Parquet files...")
+    # Define the paths to your Parquet files
+    data_files = {
+        'train': 'training_data/*.parquet',
+        'validation': 'evaluation_data/*.parquet'
+    }
+
+    # Load the datasets
+    dataset = load_dataset('parquet', data_files=data_files)
+
+    # Access the train and validation datasets
+    train_dataset = dataset['train']
+    eval_dataset = dataset['validation']
 
     # For testing purposes, select a random sample of the dataset based on its number of rows
     if args.test_mode:
@@ -133,14 +141,10 @@ def main():
         eval_dataset = eval_dataset.select(eval_indices)
 
         # Set the number of steps and epochs for quick testing
-        args.max_steps = 10  # Run only 10 steps in test mode
         args.num_train_epochs = 1  # Run only 1 epoch
         
         # Disable pushing to Hugging Face Hub when in test mode
         args.push_to_hub = False
-
-    logger.info("Shuffling train dataset...")
-    train_dataset = train_dataset.with_format(None)
 
     # Define evaluation metric
     logger.info("Loading evaluation metric...")
@@ -172,8 +176,8 @@ def main():
 
         # If normalization is enabled, apply the normalizer
         if do_normalize_eval:
-            pred_str = [normalizer(pred) for pred in pred_str]
-            label_str = [normalizer(label) for label in label_str]
+            pred_str = [normalizer(pred).lower() for pred in pred_str]
+            label_str = [normalizer(label).lower() for label in label_str]
 
         # Filtering step to only evaluate samples that have non-empty references
         pred_str = [pred for pred, label in zip(pred_str, label_str) if len(label) > 0]
@@ -188,7 +192,6 @@ def main():
 
         return {"wer": wer}
 
-
     # Define the training arguments
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
@@ -197,8 +200,9 @@ def main():
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        warmup_steps=500,
-        max_steps=args.max_steps,
+        warmup_ratio=0.15,
+        # Remove or set max_steps to -1 to use num_train_epochs
+        max_steps=-1,  # Set to -1 so it doesn't override num_train_epochs
         fp16=args.fp16,
         eval_strategy="steps",
         per_device_eval_batch_size=args.per_device_eval_batch_size,
