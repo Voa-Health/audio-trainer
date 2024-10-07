@@ -9,7 +9,7 @@ import argparse
 import logging
 import json
 from tqdm import tqdm
-from transformers import WhisperProcessor
+from transformers import WhisperProcessor, WhisperTokenizer, WhisperFeatureExtractor
 from torchaudio.transforms import Resample
 from datasets import Dataset
 import boto3
@@ -32,7 +32,11 @@ s3 = boto3.client("s3",
 s3_bucket_name = 'voa-hf-datasets'
 
 # Processor and tokenizer setup (replace with your processor and tokenizer setup)
-processor = WhisperProcessor.from_pretrained("pierreguillou/whisper-medium-portuguese", language="Portuguese", task="transcribe")
+processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+
+tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3-turbo")
+
+feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3-turbo")
 
 # Prepare the dataset function with retries for torchaudio.load()
 def prepare_dataset(row):
@@ -69,7 +73,7 @@ def prepare_dataset(row):
 
         # Compute input features using your processor's feature extractor
         try:
-            input_features = processor.feature_extractor(
+            input_features = feature_extractor(
                 incoming_waveform.squeeze().numpy(), sampling_rate=target_sample_rate
             ).input_features[0]
         except Exception as e:
@@ -99,7 +103,7 @@ def prepare_dataset(row):
 
         # Encode target text to label ids
         try:
-            labels = processor.tokenizer(transcription).input_ids
+            labels = tokenizer(transcription).input_ids
         except Exception as e:
             raise ValueError(f"Error tokenizing transcription: {e}") from e
 
@@ -151,6 +155,7 @@ def save_dataset_results(results, batch_number):
 
     # Upload to S3
     try:
+        file_name = 'whisper-turbo/' + file_name
         s3.upload_fileobj(buffer, s3_bucket_name, file_name)
         logging.info(f"Saved {len(results)} rows to s3://{s3_bucket_name}/{file_name}")
     except Exception as e:

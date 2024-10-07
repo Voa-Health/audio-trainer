@@ -6,6 +6,8 @@ import argparse
 import torch
 import evaluate
 import logging
+from io import BytesIO
+import torchaudio
 import random
 from transformers import (
     WhisperForConditionalGeneration,
@@ -15,9 +17,9 @@ from transformers import (
     set_seed,
     TrainerCallback,
     logging as transformers_logging,  # Import the transformers logging module
+    get_cosine_schedule_with_warmup,
 )
-from transformers.models.whisper.english_normalizer import BasicTextNormalizer
-from datasets import load_dataset
+from datasets import load_dataset, Audio
 from typing import Any, Dict, List, Union
 from dataclasses import dataclass
 
@@ -28,24 +30,25 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
+    decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # Split inputs and labels since they have to be of different lengths and need different padding methods
-        # First treat the audio inputs by simply returning torch tensors
+        # split inputs and labels since they have to be of different lengths and need different padding methods
+        # first treat the audio inputs by simply returning torch tensors
         input_features = [{"input_features": feature["input_features"]} for feature in features]
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
-        # Get the tokenized label sequences
+        # get the tokenized label sequences
         label_features = [{"input_ids": feature["labels"]} for feature in features]
-        # Pad the labels to max length
+        # pad the labels to max length
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
 
-        # Replace padding with -100 to ignore loss correctly
-        labels = labels_batch["input_ids"].masked_fill(labels_batch["attention_mask"].ne(1), -100)
+        # replace padding with -100 to ignore loss correctly
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
 
-        # If bos token is appended in previous tokenization step,
-        # cut bos token here as it's appended later anyways
-        if labels.shape[1] > 0 and (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+        # if bos token is appended in previous tokenization step,
+        # cut bos token here as it's append later anyways
+        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
 
         batch["labels"] = labels
@@ -61,12 +64,14 @@ class LoggingCallback(TrainerCallback):
 
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune Whisper model for speech recognition")
-    parser.add_argument('--model_name_or_path', type=str, default='pierreguillou/whisper-medium-portuguese', help='Pretrained model identifier')
+    parser.add_argument('--model_name_or_path', type=str, default='openai/whisper-large-v3-turbo', help='Pretrained model identifier')
     parser.add_argument('--output_dir', type=str, default='./whisper-finetuned', help='Directory to save the fine-tuned model')
     parser.add_argument('--num_train_epochs', type=int, default=3, help='Number of training epochs')
     parser.add_argument('--per_device_train_batch_size', type=int, default=64, help='Training batch size per device')
     parser.add_argument('--per_device_eval_batch_size', type=int, default=8, help='Evaluation batch size per device')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--warmup_steps', type=int, default=500, help='Number of warmup steps for the learning rate scheduler')
+    parser.add_argument('--num_cycles', type=float, default=0.5, help='Number of cycles for the cosine scheduler')
     parser.add_argument('--learning_rate', type=float, default=1e-5, help='Learning rate')
     parser.add_argument('--logging_steps', type=int, default=25, help='Logging interval')
     parser.add_argument('--eval_steps', type=int, default=1000, help='Evaluation interval')
@@ -100,37 +105,97 @@ def main():
     transformers_logging.enable_explicit_format()
 
     # Load the processor and the model
-    processor = WhisperProcessor.from_pretrained(args.model_name_or_path)
-    model = WhisperForConditionalGeneration.from_pretrained(args.model_name_or_path)
+    processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
 
-    data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+    model = WhisperForConditionalGeneration.from_pretrained(args.model_name_or_path)
 
     # Update model configuration
     model.config.forced_decoder_ids = None
-    # Set suppress_tokens to None to use default suppression tokens
-    model.config.suppress_tokens = None
+    model.config.suppress_tokens = []
     model.config.use_cache = False  # Important for gradient checkpointing
 
-    # Load your datasets directly from Parquet files
-    logger.info("Loading datasets from Parquet files...")
-    # Define the paths to your Parquet files
-    data_files = {
-        'train': 'training_data/*.parquet',
-        'validation': 'evaluation_data/*.parquet'
-    }
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+        processor=processor,
+        decoder_start_token_id=model.config.decoder_start_token_id,
+    )
+
+    # Load your datasets directly from Huggingface
+    logger.info("Loading datasets from Huggingface...")
 
     # Load the datasets
-    dataset = load_dataset('parquet', data_files=data_files)
+    train_dataset = load_dataset("voa-engines/voa_audios_1_0", split="train").cast_column("audio", Audio(decode=False))
+    test_dataset = load_dataset("voa-engines/voa_audios_1_0", split="test").cast_column("audio", Audio(decode=False))
 
-    # Access the train and validation datasets
-    train_dataset = dataset['train']
-    eval_dataset = dataset['validation']
+    def prepare_dataset(batch):
+        try:
+            # Load MP3 audio bytes
+            audio_bytes = batch['audio']['bytes']
+            
+            # Check if audio_bytes is empty or None
+            if not audio_bytes:
+                raise ValueError("Audio bytes are missing or null")
+    
+            # Wrap the audio bytes in a BytesIO object
+            audio_file = BytesIO(audio_bytes)
+    
+            # Try to load the audio bytes to check if the audio is valid
+            try:
+                torchaudio.set_audio_backend("ffmpeg")  # Ensure FFmpeg is installed
+                # Attempt to load the audio
+                incoming_waveform, sample_rate = torchaudio.load(audio_file, format='mp3')
+            except Exception as e:
+                raise ValueError(f"Failed to load MP3 audio with torchaudio: {e}")
+    
+            # Optional resampling to 16kHz if required
+            target_sample_rate = 16000
+            if sample_rate != target_sample_rate:
+                resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sample_rate)
+                incoming_waveform = resampler(incoming_waveform)
+    
+            # Compute input features using your processor's feature extractor
+            try:
+                batch["input_features"] = processor.feature_extractor(
+                    incoming_waveform.squeeze().numpy(), sampling_rate=target_sample_rate
+                ).input_features[0]
+            except Exception as e:
+                raise ValueError(f"Error extracting features: {e}")
+    
+            # Compute the input length in seconds
+            batch["input_length"] = incoming_waveform.size(1) / target_sample_rate
+            
+            # Process transcription and labels
+            # Try both 'transcription' and 'sentence' keys if applicable
+            transcription = batch.get("transcription")
+
+            # Encode target text to label ids
+            try:
+                batch["labels"] = processor.tokenizer(transcription).input_ids
+            except Exception as e:
+                raise ValueError(f"Error tokenizing transcription: {e}")
+    
+            return batch
+
+        except ValueError as ve:
+            print(f"Skipping corrupted data: {ve}")
+            return None  # Returning None will exclude this batch from the final dataset\
+
+    train_dataset = train_dataset.map(
+        prepare_dataset,
+        remove_columns=['audio', 'transcription', 'id'],  # Remove unnecessary columns after processing
+        batched=False
+    ).with_format("torch")
+
+    test_dataset = test_dataset.map(
+        prepare_dataset,
+        remove_columns=['audio', 'transcription', 'id'],  # Remove unnecessary columns after processing
+        batched=False
+    ).with_format("torch")
 
     # For testing purposes, select a random sample of the dataset based on its number of rows
     if args.test_mode:
         # Select random indices from the train dataset based on its total number of rows
         train_num_rows = train_dataset.num_rows
-        eval_num_rows = eval_dataset.num_rows
+        eval_num_rows = test_dataset.num_rows
 
         # Generate random indices
         train_indices = random.sample(range(train_num_rows), k=180)
@@ -138,7 +203,7 @@ def main():
 
         # Use the random indices to select a subset
         train_dataset = train_dataset.select(train_indices)
-        eval_dataset = eval_dataset.select(eval_indices)
+        test_dataset = test_dataset.select(eval_indices)
 
         # Set the number of steps and epochs for quick testing
         args.num_train_epochs = 1  # Run only 1 epoch
@@ -150,47 +215,22 @@ def main():
     logger.info("Loading evaluation metric...")
     metric = evaluate.load("wer")
 
-    # Define normalizer if needed
-    normalizer = BasicTextNormalizer()
-
-    do_normalize_eval = True  # Set to False if you don't want to normalize during evaluation
-
     def compute_metrics(pred):
         pred_ids = pred.predictions
         label_ids = pred.label_ids
 
-        # Ensure pred_ids and label_ids are not empty or None before proceeding
-        if pred_ids is None or label_ids is None:
-            return {"wer": float('inf')}
-
-        # Replace -100 with the pad_token_id in label_ids
+        # replace -100 with the pad_token_id
         label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
-        # Ensure that pred_ids and label_ids are of the same length
-        if len(pred_ids) == 0 or len(label_ids) == 0:
-            return {"wer": float('inf')}  # Return a high WER value if there's no valid prediction or label
-
-        # Decode predictions and references, filtering out invalid or empty sequences
+        # we do not want to group tokens when computing the metrics
         pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-        # If normalization is enabled, apply the normalizer
-        if do_normalize_eval:
-            pred_str = [normalizer(pred).lower() for pred in pred_str]
-            label_str = [normalizer(label).lower() for label in label_str]
-
-        # Filtering step to only evaluate samples that have non-empty references
-        pred_str = [pred for pred, label in zip(pred_str, label_str) if len(label) > 0]
-        label_str = [label for label in label_str if len(label) > 0]
-
-        # Ensure there is something to compare after filtering
-        if len(pred_str) == 0 or len(label_str) == 0:
-            return {"wer": float('inf')}  # Return a high WER value if there's nothing to compare
-
-        # Calculate Word Error Rate (WER)
         wer = 100 * metric.compute(predictions=pred_str, references=label_str)
 
-        return {"wer": wer}
+        return {'wer': wer}
+
+    optimizer=torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     # Define the training arguments
     training_args = Seq2SeqTrainingArguments(
@@ -200,9 +240,9 @@ def main():
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        warmup_ratio=0.15,
+        warmup_steps=args.warmup_steps,
         # Remove or set max_steps to -1 to use num_train_epochs
-        max_steps=-1,  # Set to -1 so it doesn't override num_train_epochs
+        max_steps=6000,  # Set to -1 so it doesn't override num_train_epochs
         fp16=args.fp16,
         eval_strategy="steps",
         per_device_eval_batch_size=args.per_device_eval_batch_size,
@@ -212,11 +252,13 @@ def main():
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
         logging_dir=args.output_dir,
+        max_grad_norm=1.0,
         logging_strategy="steps",
         logging_first_step=True,
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="wer",
+        dataloader_num_workers=8,
         greater_is_better=False,
         seed=args.seed,
         report_to=["tensorboard"],
@@ -225,15 +267,24 @@ def main():
         ddp_find_unused_parameters=False,
     )
 
+        # Create the cosine scheduler
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=training_args.warmup_steps,
+        num_training_steps=training_args.max_steps,
+        num_cycles=args.num_cycles
+    )
+
     # Initialize the Trainer
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        eval_dataset=test_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        tokenizer=processor.tokenizer,
+        tokenizer=processor,
+        optimizers=(optimizer, lr_scheduler),
         callbacks=[LoggingCallback()],
     )
 
@@ -244,7 +295,6 @@ def main():
     # Save the trained model and processor
     logger.info("Training completed. Saving model and processor.")
     trainer.save_model()
-    processor.save_pretrained(args.output_dir)
 
 if __name__ == "__main__":
     main()
