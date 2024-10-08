@@ -123,8 +123,8 @@ def main():
     logger.info("Loading datasets from Huggingface...")
 
     # Load the datasets
-    train_dataset = load_dataset("voa-engines/voa_audios_1_0", split="train").cast_column("audio", Audio(decode=False))
-    test_dataset = load_dataset("voa-engines/voa_audios_1_0", split="test").cast_column("audio", Audio(decode=False))
+    train_dataset = load_dataset("voa-engines/voa_audios_1_0", split="train", num_proc=32).cast_column("audio", Audio(decode=False))
+    test_dataset = load_dataset("voa-engines/voa_audios_1_0", split="test", num_proc=32).cast_column("audio", Audio(decode=False))
 
     def prepare_dataset(batch):
         try:
@@ -182,20 +182,22 @@ def main():
     train_dataset = train_dataset.map(
         prepare_dataset,
         remove_columns=['audio', 'transcription', 'id'],  # Remove unnecessary columns after processing
-        batched=False
+        batched=False,
+        num_proc=16
     ).with_format("torch")
 
     test_dataset = test_dataset.map(
         prepare_dataset,
         remove_columns=['audio', 'transcription', 'id'],  # Remove unnecessary columns after processing
-        batched=False
+        batched=False,
+        num_proc=16
     ).with_format("torch")
 
     # For testing purposes, select a random sample of the dataset based on its number of rows
     if args.test_mode:
         # Select random indices from the train dataset based on its total number of rows
         train_num_rows = train_dataset.num_rows
-        eval_num_rows = test_dataset.num_rows
+        eval_num_rows = eval_dataset.num_rows
 
         # Generate random indices
         train_indices = random.sample(range(train_num_rows), k=180)
@@ -203,7 +205,7 @@ def main():
 
         # Use the random indices to select a subset
         train_dataset = train_dataset.select(train_indices)
-        test_dataset = test_dataset.select(eval_indices)
+        eval_dataset = eval_dataset.select(eval_indices)
 
         # Set the number of steps and epochs for quick testing
         args.num_train_epochs = 1  # Run only 1 epoch
