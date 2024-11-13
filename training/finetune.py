@@ -6,6 +6,7 @@ import argparse
 import torch
 import evaluate
 import logging
+from functools import partial
 from io import BytesIO
 import torchaudio
 import random
@@ -17,9 +18,11 @@ from transformers import (
     set_seed,
     TrainerCallback,
     logging as transformers_logging,  # Import the transformers logging module
-    get_cosine_schedule_with_warmup,
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup
 )
-from datasets import load_dataset, Audio
+from datasets import load_dataset, Audio, concatenate_datasets
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from typing import Any, Dict, List, Union
 from dataclasses import dataclass
 
@@ -30,7 +33,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
-    decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         # split inputs and labels since they have to be of different lengths and need different padding methods
@@ -48,7 +50,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         # if bos token is appended in previous tokenization step,
         # cut bos token here as it's append later anyways
-        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
             labels = labels[:, 1:]
 
         batch["labels"] = labels
@@ -105,26 +107,38 @@ def main():
     transformers_logging.enable_explicit_format()
 
     # Load the processor and the model
-    processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+    processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo", task="transcribe")
 
     model = WhisperForConditionalGeneration.from_pretrained(args.model_name_or_path)
 
     # Update model configuration
-    model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
-    model.config.use_cache = False  # Important for gradient checkpointing
+    # disable cache during training since it's incompatible with gradient checkpointing
+    model.config.use_cache = False
+
+    # set language and task for generation and re-enable cache
+    model.generate = partial(
+        model.generate, language="sinhalese", task="transcribe", use_cache=True
+    )
 
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
         processor=processor,
-        decoder_start_token_id=model.config.decoder_start_token_id,
     )
 
     # Load your datasets directly from Huggingface
     logger.info("Loading datasets from Huggingface...")
 
-    # Load the datasets
-    train_dataset = load_dataset("voa-engines/voa_audios_1_0", split="train", num_proc=32).cast_column("audio", Audio(decode=False))
-    test_dataset = load_dataset("voa-engines/voa_audios_1_0", split="test", num_proc=32).cast_column("audio", Audio(decode=False))
+    voa_dataset = load_dataset("voa-engines/voa_audios_3_0", "validated", split="train", num_proc=32).cast_column("audio", Audio(decode=False, sampling_rate=16000, mono=True))
+    resample_pt = load_dataset("voa-engines/common_voice_resample", "pt", split="train", num_proc=32).cast_column("audio", Audio(decode=False, sampling_rate=16000, mono=True)).rename_column("sentence", "transcription")
+    resample_en = load_dataset("voa-engines/common_voice_resample", "en", split="train", num_proc=32).cast_column("audio", Audio(decode=False, sampling_rate=16000, mono=True)).rename_column("sentence", "transcription")
+    resample_es = load_dataset("voa-engines/common_voice_resample", "es", split="train", num_proc=32).cast_column("audio", Audio(decode=False, sampling_rate=16000, mono=True)).rename_column("sentence", "transcription")
+    resample_it = load_dataset("voa-engines/common_voice_resample", "it", split="train", num_proc=32).cast_column("audio", Audio(decode=False, sampling_rate=16000, mono=True)).rename_column("sentence", "transcription")
+    resample_ro = load_dataset("voa-engines/common_voice_resample", "ro", split="train", num_proc=32).cast_column("audio", Audio(decode=False, sampling_rate=16000, mono=True)).rename_column("sentence", "transcription")
+    resample_fr = load_dataset("voa-engines/common_voice_resample", "fr", split="train", num_proc=32).cast_column("audio", Audio(decode=False, sampling_rate=16000, mono=True)).rename_column("sentence", "transcription")
+
+    train_dataset = concatenate_datasets([voa_dataset, resample_pt, resample_en, resample_es, resample_fr, resample_it, resample_ro])
+
+
+    test_dataset = load_dataset("voa-engines/voa_audios_eval", split="train", num_proc=32).cast_column("audio", Audio(decode=False, sampling_rate=16000, mono=True))
 
     def prepare_dataset(batch):
         try:
@@ -159,9 +173,12 @@ def main():
                 ).input_features[0]
             except Exception as e:
                 raise ValueError(f"Error extracting features: {e}")
-    
-            # Compute the input length in seconds
-            batch["input_length"] = incoming_waveform.size(1) / target_sample_rate
+            
+            try:
+                # Compute the input length in seconds
+                batch["input_length"] = incoming_waveform.size(1) / target_sample_rate
+            except Exception as e:
+                raise ValueError(f"Error computing input length: {e}")
             
             # Process transcription and labels
             # Try both 'transcription' and 'sentence' keys if applicable
@@ -178,20 +195,52 @@ def main():
         except ValueError as ve:
             print(f"Skipping corrupted data: {ve}")
             return None  # Returning None will exclude this batch from the final dataset\
+        
+    max_input_length = 30.0
+
+    def is_audio_in_length_range(length):
+        return length < max_input_length
+
+    def is_transcription_in_length_range(transcription):
+        return len(transcription) < 688
+
+    train_dataset = train_dataset.filter(
+        is_transcription_in_length_range,
+        input_columns=["transcription"],
+        num_proc=32
+    )
+
+    test_dataset = test_dataset.filter(
+        is_transcription_in_length_range,
+        input_columns=["transcription"],
+        num_proc=32
+    )
 
     train_dataset = train_dataset.map(
         prepare_dataset,
-        remove_columns=['audio', 'transcription', 'id'],  # Remove unnecessary columns after processing
+        remove_columns=['audio', 'transcription'],  # Remove unnecessary columns after processing
         batched=False,
         num_proc=16
     ).with_format("torch")
 
     test_dataset = test_dataset.map(
         prepare_dataset,
-        remove_columns=['audio', 'transcription', 'id'],  # Remove unnecessary columns after processing
+        remove_columns=['audio', 'transcription'],  # Remove unnecessary columns after processing
         batched=False,
         num_proc=16
     ).with_format("torch")
+
+    train_dataset = train_dataset.filter(
+        is_audio_in_length_range,
+        input_columns=["input_length"],
+        num_proc=32
+    )
+
+    test_dataset = test_dataset.filter(
+        is_audio_in_length_range,
+        input_columns=["input_length"],
+        num_proc=32
+    )
 
     # For testing purposes, select a random sample of the dataset based on its number of rows
     if args.test_mode:
@@ -217,6 +266,8 @@ def main():
     logger.info("Loading evaluation metric...")
     metric = evaluate.load("wer")
 
+    normalizer = BasicTextNormalizer()
+
     def compute_metrics(pred):
         pred_ids = pred.predictions
         label_ids = pred.label_ids
@@ -225,12 +276,28 @@ def main():
         label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
         # we do not want to group tokens when computing the metrics
-        pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-        label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+        pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
+        label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
 
-        wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+        # compute orthographic wer
+        wer_ortho = 100 * metric.compute(predictions=pred_str, references=label_str)
 
-        return {'wer': wer}
+        # compute normalised WER
+        pred_str_norm = [normalizer(pred) for pred in pred_str]
+        label_str_norm = [normalizer(label) for label in label_str]
+        # filtering step to only evaluate the samples that correspond to non-zero references:
+        pred_str_norm = [
+            pred_str_norm[i] for i in range(len(pred_str_norm)) if len(label_str_norm[i]) > 0
+        ]
+        label_str_norm = [
+            label_str_norm[i]
+            for i in range(len(label_str_norm))
+            if len(label_str_norm[i]) > 0
+        ]
+
+        wer = 100 * metric.compute(predictions=pred_str_norm, references=label_str_norm)
+
+        return {"wer_ortho": wer_ortho, "wer": wer}
 
     optimizer=torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -244,7 +311,7 @@ def main():
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         # Remove or set max_steps to -1 to use num_train_epochs
-        max_steps=6000,  # Set to -1 so it doesn't override num_train_epochs
+        max_steps=-1,  # Set to -1 so it doesn't override num_train_epochs
         fp16=args.fp16,
         eval_strategy="steps",
         per_device_eval_batch_size=args.per_device_eval_batch_size,
@@ -270,7 +337,13 @@ def main():
     )
 
         # Create the cosine scheduler
-    lr_scheduler = get_cosine_schedule_with_warmup(
+    lr_constant_scheduler = get_constant_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=training_args.warmup_steps,
+    )
+
+            # Create the cosine scheduler
+    lr_cosine_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=training_args.warmup_steps,
         num_training_steps=training_args.max_steps,
@@ -286,7 +359,7 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         tokenizer=processor,
-        optimizers=(optimizer, lr_scheduler),
+        optimizers=(optimizer, lr_constant_scheduler),
         callbacks=[LoggingCallback()],
     )
 
